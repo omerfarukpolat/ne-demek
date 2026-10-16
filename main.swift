@@ -4,6 +4,7 @@
 // Derlemek/kurmak için: ./build.sh
 
 import AppKit
+import Security
 
 // MARK: - Ayarlar
 
@@ -28,20 +29,43 @@ enum Config {
     """
 }
 
+// MARK: - Claude Code oturum anahtarı
+
+enum Credentials {
+    /// Claude Code'un keychain kaydının son değişme zamanı. Yalnızca öznitelik okunur, anahtarın kendisi okunmaz.
+    /// Başka bir Claude oturumu anahtarı yenilediğinde bu zaman değişir.
+    static func lastChanged() -> Date? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "Claude Code-credentials",
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var out: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &out) == errSecSuccess else { return nil }
+        return (out as? [String: Any])?[kSecAttrModificationDate as String] as? Date
+    }
+}
+
 // MARK: - Claude süreci (stream-json ile tek seferlik soru)
 
 final class ClaudeProcess {
     private let process = Process()
     private let inPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
     let createdAt = Date()
+    /// Süreç başlarken keychain'deki anahtarın sürümü; değişmişse bu süreç eski anahtarla kalmıştır.
+    let credentialsDate = Credentials.lastChanged()
     private var lineBuffer = Data()
     private var errBuffer = Data()
     private var streamed = ""
     private var done = false
     var onDelta: ((String) -> Void)?
-    var onFinish: ((_ text: String?, _ error: String?) -> Void)?
+    var onFinish: ((_ text: String?, _ error: String?, _ authFailed: Bool) -> Void)?
 
     var isAlive: Bool { process.isRunning && !done }
+
+    /// Test için: NE_DEMEK_TEST_BREAK_FIRST ortam değişkeni varsa ilk süreç geçersiz anahtarla başlar.
+    private static var breakNext = ProcessInfo.processInfo.environment["NE_DEMEK_TEST_BREAK_FIRST"] != nil
 
     init?() {
         guard let exe = ClaudeProcess.findClaude() else { return nil }
@@ -66,6 +90,10 @@ final class ClaudeProcess {
             "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8", "TMPDIR": NSTemporaryDirectory(),
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_AUTOUPDATER": "1",
         ]
+        if ClaudeProcess.breakNext {
+            ClaudeProcess.breakNext = false
+            process.environment?["ANTHROPIC_API_KEY"] = "invalid-test-key"
+        }
         process.standardInput = inPipe
         process.standardOutput = outPipe
         process.standardError = errPipe
@@ -132,8 +160,15 @@ final class ClaudeProcess {
         case "result":
             let isError = obj["is_error"] as? Bool ?? false
             let text = (obj["result"] as? String) ?? ""
-            if isError { finish(nil, text.isEmpty ? "Bilinmeyen bir hata oluştu." : text) }
-            else { finish(text.isEmpty ? streamed : text, nil) }
+            if isError {
+                let status = obj["api_error_status"] as? Int
+                let lower = text.lowercased()
+                let auth = status == 401 || status == 403
+                    || ["authenticate", "oauth", "api key", "not logged in"].contains { lower.contains($0) }
+                finish(nil, text.isEmpty ? "Bilinmeyen bir hata oluştu." : text, authFailed: auth)
+            } else {
+                finish(text.isEmpty ? streamed : text, nil)
+            }
             try? inPipe.fileHandleForWriting.close()
         default:
             break
@@ -150,13 +185,13 @@ final class ClaudeProcess {
         process.terminationHandler = nil
     }
 
-    private func finish(_ text: String?, _ error: String?) {
+    private func finish(_ text: String?, _ error: String?, authFailed: Bool = false) {
         guard !done else { return }
         done = true
         let cb = onFinish
         onDelta = nil
         onFinish = nil
-        cb?(text, error)
+        cb?(text, error, authFailed)
     }
 }
 
@@ -179,12 +214,21 @@ final class Explainer {
             cache = saved
         }
         prewarm()
-        timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in self?.prewarm() }
+        // Anahtar değişimi ucuz bir öznitelik sorgusuyla kontrol edilir; bekleyen süreç sıcak ve geçerli kalır.
+        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.prewarm() }
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil,
+                                                          queue: .main) { [weak self] _ in self?.prewarm() }
     }
 
-    /// Bir sonraki soru için hazır `claude` süreci tutar; eskiyen veya ölen süreci yeniler.
+    /// Bekleyen süreç hâlâ kullanılabilir mi: çalışıyor, çok eski değil ve başladığından beri anahtar yenilenmemiş.
+    private func isFresh(_ p: ClaudeProcess) -> Bool {
+        p.isAlive && Date().timeIntervalSince(p.createdAt) < Config.spareMaxAge
+            && p.credentialsDate == Credentials.lastChanged()
+    }
+
+    /// Bir sonraki soru için hazır `claude` süreci tutar; eskiyen, ölen veya eski anahtarla kalan süreci yeniler.
     func prewarm() {
-        if let s = spare, s.isAlive, Date().timeIntervalSince(s.createdAt) < Config.spareMaxAge { return }
+        if let s = spare, isFresh(s) { return }
         spare?.terminate()
         spare = ClaudeProcess()
     }
@@ -193,28 +237,41 @@ final class Explainer {
         cancel()
         let key = text.lowercased()
         if let hit = cache[key] { onUpdate(hit, true); return }
+        ask(text, key: key, canRetry: true, onUpdate: onUpdate, onError: onError)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.prewarm() }
+    }
 
-        var proc = spare?.isAlive == true ? spare : nil
-        if proc == nil { spare?.terminate(); proc = ClaudeProcess() }
-        spare = nil
-        guard let p = proc else {
-            onError("Claude Code bulunamadı. Terminal'de `claude` komutunun çalıştığından emin ol.")
-            return
+    private func ask(_ text: String, key: String, canRetry: Bool,
+                     onUpdate: @escaping (String, Bool) -> Void, onError: @escaping (String) -> Void) {
+        let p: ClaudeProcess
+        if let s = spare, isFresh(s) {
+            p = s
+        } else {
+            spare?.terminate()
+            guard let fresh = ClaudeProcess() else {
+                onError("Claude Code bulunamadı. Terminal'de `claude` komutunun çalıştığından emin ol.")
+                return
+            }
+            p = fresh
         }
+        spare = nil
         active = p
         p.onDelta = { onUpdate($0, false) }
-        p.onFinish = { [weak self] answer, error in
-            guard let self else { return }
-            if self.active === p { self.active = nil }
+        p.onFinish = { [weak self] answer, error, authFailed in
+            guard let self, self.active === p else { return }
+            self.active = nil
             if let answer, !answer.isEmpty {
                 self.store(key, answer)
                 onUpdate(answer, true)
+            } else if authFailed && canRetry {
+                // Süreç, başka bir Claude oturumunun yenilediği eski anahtarla kalmış olabilir: taze süreçle bir kez daha dene.
+                NSLog("NeDemek: kimlik hatası, taze süreçle yeniden deneniyor: %@", error ?? "")
+                self.ask(text, key: key, canRetry: false, onUpdate: onUpdate, onError: onError)
             } else {
-                onError(Explainer.friendly(error))
+                onError(Explainer.friendly(error, authFailed: authFailed))
             }
         }
         if !p.send(text) { p.terminate(); active = nil; onError("Claude'a ulaşılamadı.") }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.prewarm() }
     }
 
     func cancel() {
@@ -231,10 +288,10 @@ final class Explainer {
         }
     }
 
-    private static func friendly(_ error: String?) -> String {
+    private static func friendly(_ error: String?, authFailed: Bool) -> String {
         let e = error ?? ""
-        if e.localizedCaseInsensitiveContains("not logged in") || e.contains("/login") {
-            return "Claude Code'a giriş yapılmamış. Terminal'de `claude` yazıp giriş yap."
+        if authFailed || e.localizedCaseInsensitiveContains("not logged in") || e.contains("/login") {
+            return "Claude Code oturumu geçersiz. Terminal'de `claude` yazıp tekrar giriş yap."
         }
         return e.isEmpty ? "Yanıt alınamadı." : "Yanıt alınamadı: \(e.prefix(300))"
     }
